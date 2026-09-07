@@ -432,7 +432,9 @@ enum MenuScanEngine {
         // searched), so a year in the query guarantees a miss — drop them
         let name = rawName.replacingOccurrences(
             of: #"\b(19|20)\d{2}\b"#, with: " ", options: .regularExpression)
-        let cleanedName = name.filter { $0.isLetter || $0.isNumber || $0 == " " }
+        // Punctuation becomes a space, never nothing: dropping the hyphen in
+        // "Cousiño-Macul" would glue it into one unsearchable word
+        let cleanedName = String(name.map { ($0.isLetter || $0.isNumber) ? $0 : " " })
 
         // Build search query — append variety from menu section header if available
         let searchQuery = variety != nil ? "\(cleanedName) \(variety!)" : cleanedName

@@ -167,7 +167,7 @@ struct WineSearchView: View {
             guard !Task.isCancelled, query == searchText else { return }
 
             // Search the SQLite catalog
-            catalogResults = WineCatalog.shared.search(query: query, limit: 50)
+            catalogResults = WineCatalog.shared.search(query: query, limit: 50, allowPartial: true)
 
             // Also search user's SwiftData wines
             let searchQuery = query

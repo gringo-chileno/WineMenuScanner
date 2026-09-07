@@ -120,44 +120,72 @@ class WineCatalog {
         print("Cached \(knownWineries.count) distinct wineries")
     }
 
-    func search(query: String, limit: Int = 50) -> [CatalogWine] {
+    /// Search the catalog. `allowPartial` lets a query that matches nothing
+    /// fall back to rows that match most of its words — menus and labels carry
+    /// extra words the catalog doesn't have ("Gran Reserva", importer text).
+    /// Off by default so the menu-scan matcher keeps its strict behavior.
+    func search(query: String, limit: Int = 50, allowPartial: Bool = false) -> [CatalogWine] {
         guard !query.isEmpty else { return [] }
 
-        var results: [CatalogWine] = []
-        // Strip diacritics and punctuation from search terms
+        // Split on punctuation as well as spaces: "Cousiño-Macul" has to become
+        // ["cousino", "macul"]. Deleting the hyphen instead glues the words into
+        // "cousinomacul", which matches no row.
         let searchTerms = query.folding(options: .diacriticInsensitive, locale: .current)
             .lowercased()
-            .components(separatedBy: .whitespaces)
-            .map { $0.filter { $0.isLetter || $0.isNumber || $0 == " " } }
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
+        guard !searchTerms.isEmpty else { return [] }
+
+        let strict = runSearch(terms: searchTerms, minMatches: searchTerms.count, limit: limit)
+        guard strict.isEmpty, allowPartial else { return strict }
+
+        let minMatches = max(2, Int((Double(searchTerms.count) * 0.6).rounded(.up)))
+        guard searchTerms.count > minMatches else { return strict }
+        return runSearch(terms: searchTerms, minMatches: minMatches, limit: limit)
+    }
+
+    private func runSearch(terms: [String], minMatches: Int, limit: Int) -> [CatalogWine] {
+        var results: [CatalogWine] = []
+        let requireAll = minMatches >= terms.count
 
         queue.sync {
             // search_text is a precomputed accent-folded lowercase concat of
             // name/winery/variety/region/country — plain LIKE against it is
             // ~50x faster than calling UNACCENT() five times per row
-            var conditions: [String] = []
-            var params: [String] = []
+            let likes = terms.indices.map { "search_text LIKE ?\($0 + 1)" }
+            let columns = "id, name, winery, variety, region, country, vintage, rating, price, type, body, acidity, food_pairings"
+            let limitParam = "?\(terms.count + 1)"
 
-            for term in searchTerms {
-                conditions.append("search_text LIKE ?")
-                params.append("%\(term)%")
+            let sql: String
+            if requireAll {
+                sql = """
+                    SELECT \(columns)
+                    FROM wines
+                    WHERE \(likes.joined(separator: " AND "))
+                    ORDER BY rating DESC
+                    LIMIT \(limitParam)
+                """
+            } else {
+                // Each LIKE is 1 or 0 in SQLite, so summing them counts the
+                // matched words; best-covered wines come back first
+                let score = likes.map { "(\($0))" }.joined(separator: " + ")
+                sql = """
+                    SELECT \(columns), \(score) AS score
+                    FROM wines
+                    WHERE \(likes.joined(separator: " OR "))
+                    GROUP BY id
+                    HAVING score >= \(minMatches)
+                    ORDER BY score DESC, rating DESC
+                    LIMIT \(limitParam)
+                """
             }
-
-            let sql = """
-                SELECT id, name, winery, variety, region, country, vintage, rating, price, type, body, acidity, food_pairings
-                FROM wines
-                WHERE \(conditions.joined(separator: " AND "))
-                ORDER BY rating DESC
-                LIMIT ?
-            """
 
             var statement: OpaquePointer?
             if sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK {
-                // Bind parameters
-                for (index, param) in params.enumerated() {
-                    sqlite3_bind_text(statement, Int32(index + 1), param, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+                for (index, term) in terms.enumerated() {
+                    sqlite3_bind_text(statement, Int32(index + 1), "%\(term)%", -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
                 }
-                sqlite3_bind_int(statement, Int32(params.count + 1), Int32(limit))
+                sqlite3_bind_int(statement, Int32(terms.count + 1), Int32(limit))
 
                 while sqlite3_step(statement) == SQLITE_ROW {
                     if let wine = wineFromStatement(statement) {
@@ -170,9 +198,6 @@ class WineCatalog {
 
         return results
     }
-
-
-
 
     private func wineFromStatement(_ statement: OpaquePointer?) -> CatalogWine? {
         guard let statement = statement else { return nil }
